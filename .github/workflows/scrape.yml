@@ -1,0 +1,97 @@
+name: Scrape NEPSE Daily Data
+
+on:
+  schedule:
+    - cron: "15 18 * * 1-5" # 00:00 NPT (UTC+05:45) after Mon-Fri NEPSE sessions
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Optional max number of symbols to scrape"
+        required: false
+        type: string
+      symbols:
+        description: "Optional comma-separated symbols (e.g. NABIL,BENH)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scraper
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Check if NEPSE was open for this trading session
+        id: market_check
+        if: ${{ github.event_name == 'schedule' }}
+        run: |
+          pip install --quiet nepsepy
+          python - <<'PY'
+          import os
+          from datetime import datetime, timedelta, timezone
+          from nepse import Nepse
+
+          npt = timezone(timedelta(hours=5, minutes=45))
+          # Subtract 12h so a ~00:00 NPT run matches the Mon-Fri session that just ended
+          target_date = (datetime.now(npt) - timedelta(hours=12)).date().isoformat()
+
+          status = Nepse().isNepseOpen()
+          as_of = str(status.get("asOf", ""))[:10]
+          print(f"NEPSE status={status}, target_date={target_date}, as_of={as_of}")
+
+          should_scrape = "true" if as_of == target_date else "false"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"should_scrape={should_scrape}\n")
+          PY
+
+      - name: Run daily adjusted prices scraper
+        if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || steps.market_check.outputs.should_scrape == 'true') }}
+        env:
+          INPUT_LIMIT: ${{ inputs.limit }}
+          INPUT_SYMBOLS: ${{ inputs.symbols }}
+        run: |
+          args=()
+          if [ -n "$INPUT_LIMIT" ]; then args+=(--limit "$INPUT_LIMIT"); fi
+          if [ -n "$INPUT_SYMBOLS" ]; then args+=(--symbols "$INPUT_SYMBOLS"); fi
+          python -m scrapers.daily_prices "${args[@]}"
+
+      - name: Run candle analytics scraper
+        if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || steps.market_check.outputs.should_scrape == 'true') }}
+        env:
+          INPUT_LIMIT: ${{ inputs.limit }}
+          INPUT_SYMBOLS: ${{ inputs.symbols }}
+        run: |
+          args=()
+          if [ -n "$INPUT_LIMIT" ]; then args+=(--limit "$INPUT_LIMIT"); fi
+          if [ -n "$INPUT_SYMBOLS" ]; then args+=(--symbols "$INPUT_SYMBOLS"); fi
+          python -m scrapers.candle_analytics "${args[@]}"
+
+      - name: Commit and push data updates
+        if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || steps.market_check.outputs.should_scrape == 'true') }}
+        run: |
+          git config user.name "Sawan-Mukhiya"
+          git config user.email "sawanmukhiy@gmail.com"
+          if [ -d data ]; then
+            git add data/
+          fi
+          if ! git diff --staged --quiet; then
+            git commit -m "data: $(date -u +%F)"
+            git pull --rebase
+            git push
+          else
+            echo "No new rows to commit."
+          fi
