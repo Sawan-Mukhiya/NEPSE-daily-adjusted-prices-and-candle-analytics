@@ -8,6 +8,7 @@ import http.client
 import json
 import os
 import random
+import shutil
 import sys
 import time
 import urllib.error
@@ -96,6 +97,16 @@ def polite_sleep(min_s: float = 0.8, max_s: float = 1.6) -> None:
         time.sleep(random.uniform(low, high))
 
 
+def load_latest_date(csv_path: Path) -> str | None:
+    """Return the date of the first data row in a newest-first CSV, or None."""
+    path = Path(csv_path)
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8-sig", newline="") as fh:
+        row = next(csv.DictReader(fh), None)
+        return row.get("date") if row else None
+
+
 def load_seen_keys(csv_path: Path) -> set[tuple[str, str]]:
     """Return existing (symbol, date) pairs from *csv_path* if it exists."""
     path = Path(csv_path)
@@ -120,11 +131,6 @@ def prepend_csv_rows(
         return 0
 
     path = Path(csv_path)
-    existing_rows: list[dict] = []
-    if path.exists():
-        with path.open("r", encoding="utf-8-sig", newline="") as fh:
-            existing_rows = list(csv.DictReader(fh))
-
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f"{path.name}.tmp")
     with tmp_path.open("w", encoding="utf-8-sig", newline="") as fh:
@@ -137,7 +143,11 @@ def prepend_csv_rows(
         )
         writer.writeheader()
         writer.writerows(new_rows)
-        writer.writerows(existing_rows)
+
+    if path.exists():
+        with path.open("rb") as src, tmp_path.open("ab") as dst:
+            src.readline()  # Skip BOM + existing header line
+            shutil.copyfileobj(src, dst)
 
     os.replace(tmp_path, path)
     return len(new_rows)
@@ -169,6 +179,11 @@ def parse_args(
         "--symbols",
         default=None,
         help="Optional comma-separated list of symbols to scrape",
+    )
+    parser.add_argument(
+        "--exclude-symbols",
+        default=None,
+        help="Optional comma-separated list of symbols to exclude",
     )
     parser.add_argument(
         "--limit",
@@ -203,6 +218,11 @@ def resolve_symbols(args: argparse.Namespace) -> list[str]:
         excluded = set(load_symbols(exclude_file))
         symbols = [s for s in symbols if s not in excluded]
 
+    exclude_symbols = getattr(args, "exclude_symbols", None)
+    if exclude_symbols:
+        excluded_cli = {s.strip() for s in exclude_symbols.split(",") if s.strip()}
+        symbols = [s for s in symbols if s not in excluded_cli]
+
     if args.limit is not None:
         return symbols[: max(0, args.limit)]
     return symbols
@@ -213,6 +233,7 @@ def run_scraper(
     fieldnames: list[str],
     build_url: Callable[[str], str],
     parse_payload: Callable[[str, dict, str], list[dict]],
+    incremental_by_latest_date: bool = True,
 ) -> int:
     """Execute an incremental per-symbol scrape and prepend new rows newest-first."""
     output_dir = Path(args.output_dir)
@@ -225,13 +246,17 @@ def run_scraper(
             polite_sleep(args.min_delay, args.max_delay)
 
         csv_path = output_dir / f"{symbol_filename(symbol)}.csv"
-        seen = load_seen_keys(csv_path)
+        latest_date = load_latest_date(csv_path) if incremental_by_latest_date else None
+        seen = set() if incremental_by_latest_date else load_seen_keys(csv_path)
+
         payload = fetch_json(build_url(symbol))
         if payload is None:
             continue
 
         symbol_rows: list[dict] = []
         for row in parse_payload(symbol, payload, scraped_at):
+            if latest_date is not None and row["date"] <= latest_date:
+                continue
             key = (row["symbol"], row["date"])
             if key in seen:
                 continue

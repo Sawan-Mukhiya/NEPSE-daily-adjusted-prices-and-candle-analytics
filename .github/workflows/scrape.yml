@@ -35,38 +35,29 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Check if NEPSE was open for this trading session
+      - name: Check market open via BBC canary
         id: market_check
         if: ${{ github.event_name == 'schedule' }}
         run: |
-          pip install --quiet nepsepy
-          python - <<'PY'
-          import os
-          from datetime import datetime, timedelta, timezone
-          from nepse import Nepse
-
-          npt = timezone(timedelta(hours=5, minutes=45))
-          # Subtract 12h so a ~00:00 NPT run matches the Mon-Fri session that just ended
-          target_date = (datetime.now(npt) - timedelta(hours=12)).date().isoformat()
-
-          status = Nepse().isNepseOpen()
-          as_of = str(status.get("asOf", ""))[:10]
-          print(f"NEPSE status={status}, target_date={target_date}, as_of={as_of}")
-
-          should_scrape = "true" if as_of == target_date else "false"
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
-              fh.write(f"should_scrape={should_scrape}\n")
-          PY
+          output=$(python -m scrapers.daily_prices --symbols BBC)
+          echo "$output"
+          if echo "$output" | grep -q "prepended 0 new row(s)"; then
+            echo "should_scrape=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_scrape=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Run daily adjusted prices scraper
         if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || steps.market_check.outputs.should_scrape == 'true') }}
         env:
           INPUT_LIMIT: ${{ inputs.limit }}
           INPUT_SYMBOLS: ${{ inputs.symbols }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           args=()
           if [ -n "$INPUT_LIMIT" ]; then args+=(--limit "$INPUT_LIMIT"); fi
           if [ -n "$INPUT_SYMBOLS" ]; then args+=(--symbols "$INPUT_SYMBOLS"); fi
+          if [ "$EVENT_NAME" = "schedule" ]; then args+=(--exclude-symbols BBC); fi
           python -m scrapers.daily_prices "${args[@]}"
 
       - name: Run candle analytics scraper
